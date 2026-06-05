@@ -1,0 +1,187 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+jobs:
+  code-quality:
+    name: Code Quality
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install SwiftLint
+        run: brew install swiftlint
+
+      - name: Install SwiftFormat
+        run: brew install swiftformat
+
+      - name: Check code formatting
+        run: |
+          swiftformat --lint MoleUI/
+          if [ $? -ne 0 ]; then
+            echo "❌ Code formatting issues found. Run 'just fmt' to fix."
+            exit 1
+          fi
+
+      - name: Run SwiftLint
+        run: |
+          swiftlint lint --strict
+          if [ $? -ne 0 ]; then
+            echo "❌ SwiftLint violations found. Run 'just lint' and fix issues."
+            exit 1
+          fi
+
+  build-and-test:
+    name: Build & Test
+    runs-on: macos-15
+    needs: code-quality
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode version
+        run: sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build
+        run: |
+          xcodebuild -scheme MoleUI \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Run unit tests
+        run: |
+          xcodebuild test -scheme MoleUI \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -only-testing:MoleUITests \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            -resultBundlePath TestResults.xcresult
+
+      - name: Run UI tests (allow failure)
+        continue-on-error: true
+        run: |
+          xcodebuild test -scheme MoleUI \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -only-testing:MoleUITests/UIFlowTests \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Generate test report
+        if: always()
+        run: |
+          if [ -d "TestResults.xcresult" ]; then
+            xcrun xcresulttool get object --legacy --format json --path TestResults.xcresult > test-results.json
+            echo "📊 Test results saved to test-results.json"
+          fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            TestResults.xcresult
+            test-results.json
+          retention-days: 30
+
+      - name: Test summary
+        if: always()
+        run: |
+          echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f "test-results.json" ]; then
+            echo "✅ Tests completed. See artifacts for detailed results." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Test results not available." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  security-scan:
+    name: Security Scan
+    runs-on: macos-15
+    needs: code-quality
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run security checks
+        run: |
+          # Check for hardcoded secrets in the whole project
+          if grep -r "AKIA\|sk_live_\|sk_test_\|ghp_\|gho_" . --exclude-dir=.git --exclude-dir=DerivedData --exclude-dir=.github; then
+            echo "❌ Potential hardcoded secrets found"
+            exit 1
+          fi
+
+          # Check for unsafe Swift patterns
+          if grep -r "unsafeBitCast\|unsafeDowncast" . --include="*.swift" --exclude-dir=DerivedData; then
+            echo "⚠️  Unsafe Swift patterns detected"
+          fi
+
+          echo "✅ Security scan passed"
+
+  test-coverage:
+    name: Test Coverage Report
+    runs-on: macos-15
+    needs: build-and-test
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate coverage
+        continue-on-error: true
+        run: |
+          xcodebuild test -scheme MoleUI \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -enableCodeCoverage YES \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            -resultBundlePath Coverage.xcresult
+
+      - name: Extract coverage data
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -d "Coverage.xcresult" ]; then
+            xcrun xccov view --report Coverage.xcresult > coverage-report.txt
+            echo "📈 Coverage report generated"
+            cat coverage-report.txt
+          fi
+
+      - name: Comment coverage on PR
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (fs.existsSync('coverage-report.txt')) {
+              const coverage = fs.readFileSync('coverage-report.txt', 'utf8');
+              const body = `## 📊 Test Coverage Report\n\n\`\`\`\n${coverage}\n\`\`\``;
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+            }
+
